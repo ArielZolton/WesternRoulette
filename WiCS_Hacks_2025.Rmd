@@ -1,0 +1,262 @@
+---
+title: "WiCS_Hacks_2025"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(fpp3)
+library(nortest)
+rm(list=ls())
+```
+
+```{r}
+file <- "r.csv"
+df <- read_csv(file, col_names = c("Time", "Quarter", "Year", "LocationGroup", "Frequency"))
+df <- df[-1, ]
+f <- function(group="West Campus") {
+  temp <- df %>% 
+    filter(LocationGroup == group) %>% 
+    select(-LocationGroup) %>%
+    arrange(Year, Quarter) %>%
+    mutate(Time = row_number()) %>%
+    #select(-Year) %>%
+    mutate(Year = as.integer(Year)) %>%
+    mutate(Quarter = as.integer(Quarter)) %>%
+    mutate(Frequency = as.integer(Frequency)) %>% 
+    slice_head(n = -1)
+  return(temp)
+}
+wampus <- f('Core')
+first_year <- wampus$Year[1]
+first_quarter <- wampus$Quarter[1]
+yearquarter_input <- paste(c(first_year, " Q", first_quarter), collapse = "")
+rows <- as.integer(nrow(wampus))
+```
+
+
+```{r}
+#
+# create tsibble
+#
+wampus_ts <- wampus %>%
+  add_column(qtr=yearquarter(yearquarter_input) + 0:(rows-1), .before=TRUE) %>%
+  as_tsibble(index=qtr) 
+#
+# Compute log(Sales)
+#
+wampus_ts <-wampus_ts %>%
+  mutate(LogFreq = log(Frequency)) %>%
+  mutate(TimeSq = Time^2)
+#
+# print tsibble
+#
+head(wampus_ts, n=10)
+```
+
+```{r}
+#
+#   Plot Sales against Time
+#
+wampus_ts$Quarter <- as.factor(wampus_ts$Quarter)
+wampus_ts %>% ggplot() +
+  geom_line(aes(x=Time, y=Frequency)) + 
+  geom_point(aes(x=Time, y=Frequency, color=Quarter)) +
+  scale_color_manual(values = c("black", "blue", "purple", "red")) +
+  ggtitle("Frequency vs. Time") + xlab("Time") + ylab("Frequency")
+```
+
+
+```{r}
+#
+#   Plot log(Frequency) against Time
+#
+wampus_ts %>% ggplot() +
+  geom_line(aes(x=Time, y=LogFreq)) + 
+  geom_point(aes(x=Time, y=LogFreq, color=Quarter)) +
+  scale_color_manual(values = c("black", "blue", "purple", "red")) +
+  ggtitle("log(Freq) vs. Time") + xlab("Time") + ylab("log(Freq)")
+```
+
+```{r}
+#
+#   Decompose log(Sales) using STL decomposition
+#
+wampus_ts %>% model(STL(LogFreq ~ trend(window=7) + season(window=7))) %>%
+  components() -> Log_Freq_components
+wampus_ts$seasonal <- Log_Freq_components$season_year
+#
+#   Copy Log_Sales_time_series_components$season_adjust into Sales_table_ts
+#
+wampus_ts$logA <- Log_Freq_components$season_adjust
+#
+#   Seasonally adjust Sales values
+#
+wampus_ts$A <- exp(wampus_ts$logA)
+head(wampus_ts)
+#
+#   Plot log(A) against Time
+#
+wampus_ts %>% ggplot() +
+  geom_line(aes(x=Time, y=logA)) + 
+  geom_point(aes(x=Time, y=logA, color=Quarter)) +
+  scale_color_manual(values = c("black", "blue", "purple", "red")) +
+  ggtitle("log(A) vs. Time") + xlab("Time") + ylab("log(A)")
+```
+
+```{r}
+#
+#   Regress log(A) against Time and Time^2
+#
+reg_output <- wampus_ts %>% model(TSLM(logA ~ Time + TimeSq))
+report(reg_output)
+reg_output_tidy <- tidy(reg_output)
+reg_output_tidy
+reg_output_glance <- glance(reg_output)
+reg_output_glance
+reg_output_augment <- augment(reg_output)
+reg_output_augment
+alpha <- reg_output_tidy$estimate[1]
+beta1 <- reg_output_tidy$estimate[2]
+beta2 <- reg_output_tidy$estimate[3]
+fitted_values_logA <- alpha + beta1*wampus_ts$Time + beta2*wampus_ts$TimeSq
+#
+#   Plot log(A) against Time with fitted values from regression
+#
+wampus_ts %>% ggplot() +
+  geom_point(aes(x=Time, y=logA)) +
+  geom_line(aes(x=Time, y=fitted_values_logA), color="Red") +
+  ggtitle("log(A) vs. Time with fitted values from regression") + xlab("Time") + ylab("log(A)")
+
+```
+
+
+
+```{r}
+#
+#   Construct Time, TimeSq and Seasonal and seasonal_forecast vectors with extra four rows for forecasting
+#
+Time <- c(wampus_ts$Time,(rows+1):(rows+4))
+Time_sq <- Time^2
+seasonal <- c(wampus_ts$seasonal, NA, NA, NA, NA)
+seasonal_forecast <- c(NA, NA, NA, NA, wampus_ts$seasonal)
+wampus_extended_ts <- tsibble(qtr = yearquarter(yearquarter_input) + 0:(rows+3),
+                                   Time=Time, Time_sq=Time_sq, seasonal = seasonal,
+                                   seasonal_forecast = seasonal_forecast,
+                                   index = qtr)
+head(wampus_extended_ts)
+wampus_extended_ts[(rows-3):(rows+4),]
+#
+#   Compute in-sample and out-of-sample forecasts
+#
+wampus_extended_ts$forecast_logA <- alpha + beta1*wampus_extended_ts$Time +
+  beta2*wampus_extended_ts$Time_sq
+wampus_extended_ts$forecast_logFreq <- wampus_extended_ts$forecast_logA + 
+  wampus_extended_ts$seasonal_forecast
+wampus_extended_ts$forecast_Frequency <- exp(wampus_extended_ts$forecast_logFreq)
+head(wampus_extended_ts)
+
+wampus_extended_ts[(rows-3):(rows+4),]
+#
+#   Plot log(A) against Time with forecasts - Cannot use pipeline notation because Sales_table_ts and
+#     Sales_table_extended_ts are different length
+#
+ggplot() +
+  geom_point(aes(x=wampus_ts$Time, y=wampus_ts$logA), color="Black") +
+  geom_line(aes(x=wampus_extended_ts$Time[1:rows], y=wampus_extended_ts$forecast_logA[1:rows]), 
+            linetype=1, color="Red") +
+  geom_line(aes(x=wampus_extended_ts$Time[rows:(rows+4)], y=wampus_extended_ts$forecast_logA[rows:(rows+4)]), 
+            linetype=2, color="Red") +
+  ggtitle("log(A) vs. Time with forecasts") + xlab("Time") + ylab("log(A)")
+```
+
+```{r}
+#
+#   Plot log(Sales) against Time with forecasts
+#
+
+ggplot() +
+  geom_point(aes(x=wampus_ts$Time, y=wampus_ts$LogFreq), color="Black") +
+  geom_line(aes(x=wampus_extended_ts$Time[5:rows], y=wampus_extended_ts$forecast_logFreq[5:rows]), 
+            linetype=1, color="Red") +
+  geom_line(aes(x=wampus_extended_ts$Time[rows:(rows+4)], y=wampus_extended_ts$forecast_logFreq[rows:(rows+4)]), 
+            linetype=2, color="Red") +
+  ggtitle("log(Freq) vs. Time with forecasts") + xlab("Time") + ylab("log(Freq)")
+```
+
+```{r}
+#
+#   Plot Sales against Time with forecasts
+#
+ggplot() +
+  geom_line(aes(x=wampus_ts$Time, y=wampus_ts$Frequency), linetype=1) +
+  geom_line(aes(x=wampus_extended_ts$Time[5:rows], y=wampus_extended_ts$forecast_Frequency[5:rows]), 
+            linetype=1, color="Red") +
+  geom_line(aes(x=wampus_extended_ts$Time[rows:(rows+4)], y=wampus_extended_ts$forecast_Frequency[rows:(rows+4)]), 
+            linetype=2, color="Red") +
+  ggtitle("Frequency vs. Time with forecasts") + xlab("Time") + ylab("Frequency")
+```
+
+
+
+```{r}
+#
+#   Plot Residuals [from the regression lm(logA ~ Time + TimeSq)] vs. Time 
+#
+
+ggplot() +
+  geom_line(aes(x=wampus_ts$Time, y=reg_output_augment$.resid)) +
+  geom_point(aes(x=wampus_ts$Time, y=reg_output_augment$.resid)) +
+  geom_hline(yintercept=0) +
+  ggtitle("Residuals vs. Time") + xlab("Time") + ylab("Residuals")
+#
+#   Compute autocorrelation coefficients using regression
+#
+residuals <- reg_output_augment$.resid
+residuals_lag1 <- lag(reg_output_augment$.resid, n = 1)
+residuals_lag2 <- lag(reg_output_augment$.resid, n = 2)
+residuals_lag3 <- lag(reg_output_augment$.resid, n = 3)
+Residuals_ts <- tsibble(qtr = yearquarter(yearquarter_input) + 0:(rows-1),
+                        residuals = residuals, 
+                        residuals_lag1 = residuals_lag1, 
+                        residuals_lag2 = residuals_lag2, 
+                        residuals_lag3 = residuals_lag3, 
+                        index = qtr)
+Residuals_ts
+reg_lag1 <- Residuals_ts %>% model(TSLM(residuals ~ residuals_lag1))
+report(reg_lag1)
+reg_lag2 <- Residuals_ts %>% model(TSLM(residuals ~ residuals_lag2))
+report(reg_lag2)
+reg_lag3 <- Residuals_ts %>% model(TSLM(residuals ~ residuals_lag3))
+report(reg_lag3)
+#
+#   Plot and print autocorrelation function of the residuals
+#
+result_ACF <- reg_output_augment %>% ACF(.resid)
+result_ACF %>% autoplot()
+print(result_ACF, n=10)
+#
+#   Check assumptions
+#
+reg_output %>% gg_tsresiduals()
+#
+#   Compute Anderson-Darling test for the residuals to test the normality assumption
+#
+ad.test(reg_output_augment$.resid)
+
+
+# 53->22, 56->25, 55->24, 0->0, 49->18, 1->1, 52->21, 5->5
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
